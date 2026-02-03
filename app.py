@@ -8,12 +8,12 @@ from io import BytesIO
 st.set_page_config(page_title="Extrator de Responsáveis", layout="wide")
 
 def clean_text(text):
-    """Limpa espaços extras."""
+    """Limpa espaços extras e normaliza o texto."""
     return " ".join(text.split()).strip()
 
 def extract_info_from_pdf(pdf_bytes, file_name):
     """
-    Extrai TODAS as ocorrências de 'CNPJ - Texto'.
+    Extrai TODAS as ocorrências de 'CNPJ/CPF - Texto', capturando também o Rótulo (Contexto).
     """
     data = []
     
@@ -30,28 +30,34 @@ def extract_info_from_pdf(pdf_bytes, file_name):
         for line in lines:
             line = line.strip()
             
-            # Filtro básico
-            if "CNPJ" in line or "Responsável" in line:
+            # Regex ajustada para capturar o prefixo (Rótulo) se existir
+            # Grupo 1: O rótulo (Ex: Responsável, CNPJ, ou vazio)
+            # Grupo 2: O Número (CNPJ/CPF)
+            # Grupo 3: O Nome (Texto após o traço)
+            
+            # Procura por: (Inicio ou espaço) + (Rótulo opcional) + (Numero) + ( - ) + (Nome)
+            match = re.search(r'(Responsável|CNPJ|CPF)?[:\s]*([\d\.\/-]{14,18})\s*-\s*(.+)', line, re.IGNORECASE)
+            
+            if match:
+                rotulo = clean_text(match.group(1)) if match.group(1) else "Indefinido"
+                doc_num = match.group(2).strip()
+                raw_text = clean_text(match.group(3))
                 
-                # Regex captura: Documento - Qualquer Coisa
-                match = re.search(r'([\d\.\/-]{14,18})\s*-\s*(.+)', line)
-                
-                if match:
-                    doc_num = match.group(1).strip()
-                    raw_text = clean_text(match.group(2))
-                    
+                # Filtro imediato de segurança (ignora se o nome for só números ou muito curto)
+                if len(raw_text) > 3 and not raw_text.replace('/','').replace('-','').isdigit():
                     data.append({
                         "Arquivo": file_name,
                         "Página": page_num + 1,
-                        "Documento (CNPJ/CPF)": doc_num,
-                        "Conteúdo Extraído": raw_text
+                        "Tipo (Rótulo)": rotulo.capitalize(), # Ex: Responsável, Cnpj
+                        "Documento": doc_num,
+                        "Nome Extraído": raw_text
                     })
 
     return data
 
 # --- Interface Streamlit ---
-st.title("📂 Extrator de Nomes (Pós-CNPJ/CPF)")
-st.markdown("Extrai o texto localizado logo após o **CNPJ** ou **CPF** (separado por ` - `).")
+st.title("📂 Extrator de Responsáveis Inteligente")
+st.markdown("Extrai nomes vinculados a **CNPJ** ou **CPF** e seleciona a melhor ocorrência.")
 
 uploaded_files = st.file_uploader(
     "Arraste seus PDFs aqui", 
@@ -74,49 +80,74 @@ if uploaded_files:
         progress_bar.empty()
 
         if all_results:
-            # SALVA NO SESSION STATE (MEMÓRIA)
             st.session_state['df_raw'] = pd.DataFrame(all_results)
             st.session_state['processed'] = True
-            st.success("Arquivos processados com sucesso!")
+            st.success("Arquivos processados! Veja o resultado abaixo.")
         else:
-            st.warning("Nenhum padrão encontrado.")
+            st.warning("Nenhum padrão 'Documento - Nome' encontrado.")
 
-# --- ÁREA DE EXIBIÇÃO (FORA DO BOTÃO) ---
-# Verifica se já existe dados na memória da sessão
+# --- ÁREA DE EXIBIÇÃO E REFINAMENTO ---
 if 'processed' in st.session_state and st.session_state['processed']:
     
     df = st.session_state['df_raw']
-    
     st.write("---")
     
     # Checkbox de Refinamento
-    usar_refinamento = st.checkbox("🔍 Aplicar Refinamento (Remover duplicatas e limpar 'lixo')", value=False)
+    usar_refinamento = st.checkbox("🔍 Refinar (Selecionar o nome mais provável para cada CNPJ)", value=True)
     
     if usar_refinamento:
-        # Lógica de Filtro
-        mask_lixo = (
-            (df["Conteúdo Extraído"].str.len() > 3) & 
-            (~df["Conteúdo Extraído"].str.contains(r'\d{2}/\d{2}/\d{4}', regex=True)) & 
-            (~df["Conteúdo Extraído"].str.contains("Página", case=False)) &
-            (~df["Conteúdo Extraído"].str.contains("PAGE", case=False))
-        )
-        df_final = df[mask_lixo].copy()
-        # Remove duplicatas mantendo a primeira ocorrência
-        df_final = df_final.drop_duplicates(subset=["Arquivo", "Documento (CNPJ/CPF)"], keep="first")
+        # --- LÓGICA DE PONTUAÇÃO (RANKING) ---
+        # Criamos uma coluna temporária de 'Pontos' para decidir qual linha é a correta
         
-        st.info(f"Refinamento Ativo: Exibindo {len(df_final)} registros únicos (de um total de {len(df)} linhas extraídas).")
+        def calcular_pontos(row):
+            pontos = 0
+            nome = row["Nome Extraído"].upper()
+            tipo = row["Tipo (Rótulo)"]
+            
+            # 1. Prioridade Máxima: Se o rótulo for "Responsável", é quase certeza que é o correto
+            if "RESPONS" in tipo.upper():
+                pontos += 100
+                
+            # 2. Penalidade para "Lixo" comum (Datas, Página)
+            if re.search(r'\d{2}/\d{2}/\d{4}', nome): pontos -= 50
+            if "PÁGINA" in nome or "PAGE" in nome: pontos -= 50
+            
+            # 3. Penalidade para Nomes de Órgãos (se queremos o CPF/Nome da Pessoa)
+            # Se você quer extrair o Prefeito, não quer extrair "MUNICIPIO DE..."
+            if "MUNICIPIO" in nome or "PREFEITURA" in nome or "SECRETARIA" in nome:
+                pontos -= 20
+            
+            # 4. Bonificação por tamanho (nomes completos costumam ser maiores que siglas)
+            if len(nome) > 10: pontos += 5
+            
+            return pontos
+
+        # Aplica a pontuação
+        df['Pontos'] = df.apply(calcular_pontos, axis=1)
+        
+        # ORDENA: Do maior ponto para o menor
+        df_sorted = df.sort_values(by=['Arquivo', 'Documento', 'Pontos'], ascending=[True, True, False])
+        
+        # REMOVE DUPLICATAS: Mantém apenas o primeiro (que agora é o de maior pontuação)
+        df_final = df_sorted.drop_duplicates(subset=["Arquivo", "Documento"], keep="first").copy()
+        
+        # Remove a coluna de pontos para não poluir a saída
+        df_final = df_final.drop(columns=['Pontos'])
+        
+        st.info(f"Refinamento Inteligente: Selecionadas as linhas mais relevantes para cada CNPJ.")
+        
     else:
         df_final = df
-        st.warning(f"Modo Bruto: Exibindo todos os {len(df)} registros (inclui repetições e dados indesejados).")
+        st.warning("Modo Bruto: Exibindo todas as ocorrências encontradas.")
     
-    # Mostra a Tabela (Sempre atualizada)
+    # Mostra a Tabela
     st.dataframe(df_final, use_container_width=True)
     
-    # Botão de Download (Sempre visível)
+    # Download
     csv = df_final.to_csv(index=False, sep=";").encode('utf-8-sig')
     st.download_button(
         label="📥 Baixar Tabela (CSV)",
         data=csv,
-        file_name="extracao_nomes.csv",
+        file_name="responsaveis_refinados.csv",
         mime="text/csv",
     )
