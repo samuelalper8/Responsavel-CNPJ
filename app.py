@@ -13,8 +13,7 @@ def clean_text(text):
 
 def extract_info_from_pdf(pdf_bytes, file_name):
     """
-    Extrai TODAS as ocorrências de 'CNPJ - Texto' encontradas,
-    sem filtrar nada inicialmente.
+    Extrai TODAS as ocorrências de 'CNPJ - Texto'.
     """
     data = []
     
@@ -31,7 +30,7 @@ def extract_info_from_pdf(pdf_bytes, file_name):
         for line in lines:
             line = line.strip()
             
-            # Filtro básico de existência
+            # Filtro básico
             if "CNPJ" in line or "Responsável" in line:
                 
                 # Regex captura: Documento - Qualquer Coisa
@@ -41,8 +40,6 @@ def extract_info_from_pdf(pdf_bytes, file_name):
                     doc_num = match.group(1).strip()
                     raw_text = clean_text(match.group(2))
                     
-                    # Salva TUDO (incluindo o que pode ser lixo)
-                    # Adicionamos o número da página para ajudar na conferência
                     data.append({
                         "Arquivo": file_name,
                         "Página": page_num + 1,
@@ -62,6 +59,7 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+# Botão de processamento
 if uploaded_files:
     if st.button("Processar Arquivos"):
         all_results = []
@@ -76,44 +74,49 @@ if uploaded_files:
         progress_bar.empty()
 
         if all_results:
-            df = pd.DataFrame(all_results)
-            
-            st.write("---")
-            
-            # --- ÁREA DE REFINAMENTO ---
-            # Por padrão vem desmarcado (mantém o lixo), mas o usuário pode ativar
-            usar_refinamento = st.checkbox("🔍 Aplicar Refinamento (Remover duplicatas e limpar 'lixo')", value=False)
-            
-            if usar_refinamento:
-                # 1. Filtros de Texto (Remove datas, paginação, nomes muito curtos)
-                # Cria uma máscara booleana para filtrar
-                mask_lixo = (
-                    df["Conteúdo Extraído"].str.len() > 3 & 
-                    ~df["Conteúdo Extraído"].str.contains(r'\d{2}/\d{2}/\d{4}', regex=True) & # Não é data
-                    ~df["Conteúdo Extraído"].str.contains("Página", case=False) &
-                    ~df["Conteúdo Extraído"].str.contains("PAGE", case=False)
-                )
-                df_refined = df[mask_lixo].copy()
-                
-                # 2. Remover Duplicatas (Mantém apenas a primeira ocorrência de cada CNPJ por Arquivo)
-                df_refined = df_refined.drop_duplicates(subset=["Arquivo", "Documento (CNPJ/CPF)"], keep="first")
-                
-                st.success(f"Refinamento aplicado! Reduzido de {len(df)} para {len(df_refined)} registros.")
-                df_final = df_refined
-            else:
-                st.info(f"Exibindo todos os {len(df)} registros extraídos (sem filtros).")
-                df_final = df
-            
-            # Exibe Tabela
-            st.dataframe(df_final, use_container_width=True)
-            
-            # Download
-            csv = df_final.to_csv(index=False, sep=";").encode('utf-8-sig')
-            st.download_button(
-                label="📥 Baixar Tabela (CSV)",
-                data=csv,
-                file_name="extracao_nomes.csv",
-                mime="text/csv",
-            )
+            # SALVA NO SESSION STATE (MEMÓRIA)
+            st.session_state['df_raw'] = pd.DataFrame(all_results)
+            st.session_state['processed'] = True
+            st.success("Arquivos processados com sucesso!")
         else:
-            st.warning("Nenhum padrão 'Documento - Texto' encontrado.")
+            st.warning("Nenhum padrão encontrado.")
+
+# --- ÁREA DE EXIBIÇÃO (FORA DO BOTÃO) ---
+# Verifica se já existe dados na memória da sessão
+if 'processed' in st.session_state and st.session_state['processed']:
+    
+    df = st.session_state['df_raw']
+    
+    st.write("---")
+    
+    # Checkbox de Refinamento
+    usar_refinamento = st.checkbox("🔍 Aplicar Refinamento (Remover duplicatas e limpar 'lixo')", value=False)
+    
+    if usar_refinamento:
+        # Lógica de Filtro
+        mask_lixo = (
+            (df["Conteúdo Extraído"].str.len() > 3) & 
+            (~df["Conteúdo Extraído"].str.contains(r'\d{2}/\d{2}/\d{4}', regex=True)) & 
+            (~df["Conteúdo Extraído"].str.contains("Página", case=False)) &
+            (~df["Conteúdo Extraído"].str.contains("PAGE", case=False))
+        )
+        df_final = df[mask_lixo].copy()
+        # Remove duplicatas mantendo a primeira ocorrência
+        df_final = df_final.drop_duplicates(subset=["Arquivo", "Documento (CNPJ/CPF)"], keep="first")
+        
+        st.info(f"Refinamento Ativo: Exibindo {len(df_final)} registros únicos (de um total de {len(df)} linhas extraídas).")
+    else:
+        df_final = df
+        st.warning(f"Modo Bruto: Exibindo todos os {len(df)} registros (inclui repetições e dados indesejados).")
+    
+    # Mostra a Tabela (Sempre atualizada)
+    st.dataframe(df_final, use_container_width=True)
+    
+    # Botão de Download (Sempre visível)
+    csv = df_final.to_csv(index=False, sep=";").encode('utf-8-sig')
+    st.download_button(
+        label="📥 Baixar Tabela (CSV)",
+        data=csv,
+        file_name="extracao_nomes.csv",
+        mime="text/csv",
+    )
